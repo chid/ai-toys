@@ -149,6 +149,8 @@ def run(llm: LLMBackend, max_tokens: int, show_reasoning: bool) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="AI Dungeon — local LLM text adventure")
+    p.add_argument("--max-tokens", type=int, default=2048, metavar="N", help="Max tokens per turn (default 2048)")
+    p.add_argument("--hide-reasoning", action="store_true", help="Hide chain-of-thought reasoning output")
     p.add_argument("--backend", choices=["openai", "llamacpp"], default=None)
     p.add_argument("--model", default=None, help="Model name (openai) or path (llamacpp)")
     p.add_argument("--model-path", default=None, help="Path to .gguf file")
@@ -167,7 +169,7 @@ def main() -> None:
     else:
         llm = default_backend()
 
-    run(llm)
+    run(llm, max_tokens=args.max_tokens, show_reasoning=not args.hide_reasoning)
 
 
 if __name__ == "__main__":

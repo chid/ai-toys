@@ -20,7 +20,7 @@ import os
 import re
 import sys
 import urllib.request
-from typing import Generator, Iterable
+from typing import Any, Callable, Generator, Iterable
 
 
 def _first_available_model(base_url: str, api_key: str) -> str | None:
@@ -69,10 +69,9 @@ class LLMBackend:
 
         elif backend == "openai":
             from openai import OpenAI  # pip install openai
-            # Most OpenAI-compat servers (llama.cpp, Ollama, LM Studio) expose
-            # endpoints under /v1. The SDK appends paths directly to base_url,
-            # so http://host:8080 → .../chat/completions (wrong);
-            #    http://host:8080/v1 → .../v1/chat/completions (correct).
+            # Most OpenAI-compat servers expose endpoints under /v1. The SDK
+            # appends paths directly to base_url, so http://host:8080 sends
+            # requests to .../chat/completions instead of .../v1/chat/completions.
             if not base_url.rstrip("/").endswith("/v1"):
                 corrected = base_url.rstrip("/") + "/v1"
                 print(
@@ -82,7 +81,6 @@ class LLMBackend:
                 )
                 base_url = corrected
             self._client = OpenAI(base_url=base_url, api_key=api_key)
-            # Auto-detect model from server when not specified
             if model is None:
                 model = _first_available_model(base_url, api_key)
                 if model:
@@ -90,8 +88,7 @@ class LLMBackend:
                 else:
                     model = "default"
                     print(
-                        "[llm_backend] Could not detect model; falling back to 'default'. "
-                        "Set LLM_MODEL to suppress this.",
+                        "[llm_backend] Could not detect model; set LLM_MODEL to suppress this.",
                         file=sys.stderr,
                     )
             self.model = model
@@ -100,7 +97,7 @@ class LLMBackend:
             raise ValueError(f"Unknown backend '{backend}'. Choose 'openai' or 'llamacpp'.")
 
     # ------------------------------------------------------------------ #
-    #  Core interface                                                       #
+    #  Core chat                                                            #
     # ------------------------------------------------------------------ #
 
     def chat(
@@ -111,37 +108,141 @@ class LLMBackend:
         temperature: float = 0.7,
         stream: bool = False,
         show_reasoning: bool = True,
+        tools: list[dict] | None = None,
     ) -> str | Generator[str, None, None]:
-        """Send a list of chat messages and return a string or token generator."""
+        """Send messages; return a string or a streaming token generator."""
         try:
             if self.backend == "llamacpp":
-                result = self._llm.create_chat_completion(
+                kw: dict = dict(
                     messages=messages,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     stream=stream,
                 )
+                if tools:
+                    kw["tools"] = tools
+                result = self._llm.create_chat_completion(**kw)
                 if stream:
                     return self._llamacpp_stream(result)
                 return result["choices"][0]["message"]["content"]
 
-            resp = self._client.chat.completions.create(
+            kw = dict(
                 model=self.model,
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=stream,
             )
+            if tools:
+                kw["tools"] = tools
+            resp = self._client.chat.completions.create(**kw)
             if stream:
                 return self._openai_stream(resp, show_reasoning=show_reasoning)
             return resp.choices[0].message.content
 
         except Exception as exc:
-            backend_info = f"backend={self.backend}, model={getattr(self, 'model', '?')}"
-            raise RuntimeError(f"LLM request failed ({backend_info}): {exc}") from exc
+            raise RuntimeError(
+                f"LLM request failed (backend={self.backend}, "
+                f"model={getattr(self, 'model', '?')}): {exc}"
+            ) from exc
+
+    def complete(self, prompt: str, **kwargs) -> str | Generator[str, None, None]:
+        """Single-turn completion shorthand."""
+        return self.chat([{"role": "user", "content": prompt}], **kwargs)
+
+    # ------------------------------------------------------------------ #
+    #  Tool-use loop                                                        #
+    # ------------------------------------------------------------------ #
+
+    def chat_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        tool_fns: dict[str, Callable],
+        *,
+        max_rounds: int = 5,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        on_tool_call: Callable[[str, dict, Any], None] | None = None,
+    ) -> str:
+        """
+        Run a tool-use loop: send messages, execute any tool_calls the model
+        requests, feed results back, repeat until the model stops or max_rounds
+        is reached. Returns the final text response.
+
+        tools        – list of OpenAI-format tool schemas
+        tool_fns     – {function_name: callable} mapping
+        on_tool_call – optional callback(name, args, result) for display/logging
+        """
+        msgs = list(messages)
+
+        for _ in range(max_rounds):
+            try:
+                resp = self._client.chat.completions.create(
+                    model=self.model,
+                    messages=msgs,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"Tool-use request failed: {exc}") from exc
+
+            msg = resp.choices[0].message
+            msgs.append(msg.model_dump(exclude_none=True))
+
+            if not msg.tool_calls:
+                return msg.content or ""
+
+            for tc in msg.tool_calls:
+                fn_name = tc.function.name
+                try:
+                    fn_args = json.loads(tc.function.arguments)
+                    result = tool_fns[fn_name](**fn_args)
+                except Exception as exc:
+                    result = f"Error calling {fn_name}: {exc}"
+
+                if on_tool_call:
+                    on_tool_call(fn_name, fn_args, result)
+
+                msgs.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": str(result),
+                })
+
+        return "[max tool rounds reached]"
+
+    # ------------------------------------------------------------------ #
+    #  Embeddings                                                           #
+    # ------------------------------------------------------------------ #
+
+    def embed(self, texts: str | list[str]) -> list[float] | list[list[float]]:
+        """
+        Return embedding vector(s). Requires an embedding-capable model.
+        str  input → list[float]
+        list input → list[list[float]]
+        """
+        single = isinstance(texts, str)
+        inputs: list[str] = [texts] if single else texts  # type: ignore[list-item]
+
+        if self.backend == "llamacpp":
+            results = [self._llm.embed(t) for t in inputs]
+        else:
+            try:
+                resp = self._client.embeddings.create(model=self.model, input=inputs)
+                results = [e.embedding for e in sorted(resp.data, key=lambda e: e.index)]
+            except Exception as exc:
+                raise RuntimeError(f"Embedding request failed: {exc}") from exc
+
+        return results[0] if single else results
+
+    # ------------------------------------------------------------------ #
+    #  Streaming internals                                                  #
+    # ------------------------------------------------------------------ #
 
     def _openai_stream(self, resp, *, show_reasoning: bool = True) -> Generator[str, None, None]:
-        """Yield content tokens; optionally print reasoning_content inline in dim style."""
+        """Yield content tokens; print reasoning_content inline in dim style."""
         DIM, RESET = "\033[2m", "\033[0m"
         in_reasoning = False
 
@@ -169,10 +270,6 @@ class LLMBackend:
         for chunk in result:
             yield chunk["choices"][0]["delta"].get("content", "")
 
-    def complete(self, prompt: str, **kwargs) -> str | Generator[str, None, None]:
-        """Single-turn completion shorthand."""
-        return self.chat([{"role": "user", "content": prompt}], **kwargs)
-
     # ------------------------------------------------------------------ #
     #  Utilities                                                            #
     # ------------------------------------------------------------------ #
@@ -195,7 +292,6 @@ class LLMBackend:
                 return json.loads(match.group(1))
             except json.JSONDecodeError:
                 pass
-        # fallback: bare JSON object/array
         match = re.search(r"(\{[\s\S]+\}|\[[\s\S]+\])", text)
         if match:
             try:
@@ -205,6 +301,81 @@ class LLMBackend:
         return None
 
 
+# ──────────────────────────────────────────────────────── Conversation ──
+
+class Conversation:
+    """
+    Stateful chat session. Owns history and wraps an LLMBackend.
+
+    Usage:
+        conv = Conversation(llm, system="You are a helpful assistant.")
+
+        # non-streaming
+        reply: str = conv.chat("Hello!")
+
+        # streaming — history is committed once the generator is exhausted
+        gen = conv.stream("Hello!")
+        full: str = llm.stream_print(gen)
+    """
+
+    def __init__(
+        self,
+        llm: LLMBackend,
+        system: str | None = None,
+        max_history: int = 20,
+    ) -> None:
+        self.llm = llm
+        self.system = system
+        self.max_history = max_history
+        self.history: list[dict] = []
+
+    def _build_messages(self, user_content: str) -> list[dict]:
+        msgs: list[dict] = []
+        if self.system:
+            msgs.append({"role": "system", "content": self.system})
+        msgs.extend(self.history)
+        msgs.append({"role": "user", "content": user_content})
+        return msgs
+
+    def _commit(self, user: str, assistant: str) -> None:
+        self.history.append({"role": "user", "content": user})
+        self.history.append({"role": "assistant", "content": assistant})
+        if len(self.history) > self.max_history * 2:
+            self.history = self.history[-(self.max_history * 2):]
+
+    def chat(self, message: str, **kwargs) -> str:
+        """Send a message, update history, return the response string."""
+        msgs = self._build_messages(message)
+        response = self.llm.chat(msgs, **kwargs)
+        assert isinstance(response, str), "Use stream() for streaming responses"
+        self._commit(message, response)
+        return response
+
+    def stream(self, message: str, **kwargs) -> Generator[str, None, None]:
+        """
+        Stream a response. History is committed once the generator is fully
+        consumed (e.g. after llm.stream_print()). Pass stream=True automatically.
+        """
+        kwargs.setdefault("stream", True)
+        msgs = self._build_messages(message)
+        gen = self.llm.chat(msgs, **kwargs)
+
+        def _capturing() -> Generator[str, None, None]:
+            buf: list[str] = []
+            for token in gen:
+                buf.append(token)
+                yield token
+            self._commit(message, "".join(buf))
+
+        return _capturing()
+
+    def reset(self) -> None:
+        """Clear conversation history (system prompt is preserved)."""
+        self.history.clear()
+
+
+# ──────────────────────────────────────────────────── default_backend ───
+
 def default_backend() -> LLMBackend:
     """Build an LLMBackend from environment variables."""
     btype = os.getenv("LLM_BACKEND", "openai")
@@ -213,7 +384,6 @@ def default_backend() -> LLMBackend:
         if not model_path:
             raise EnvironmentError("Set LLM_MODEL=/path/to/model.gguf for llamacpp backend")
         return LLMBackend("llamacpp", model_path=model_path)
-    # model=None triggers auto-detection from /v1/models
     return LLMBackend(
         "openai",
         model=os.getenv("LLM_MODEL") or None,

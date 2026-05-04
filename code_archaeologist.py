@@ -53,7 +53,7 @@ design, brilliant-but-sleep-deprived senior, etc.)
 Stay in character throughout. Keep the entire report under 550 words. Use markdown."""
 
 
-def analyse(code: str, filename: str, llm: LLMBackend) -> None:
+def analyse(code: str, filename: str, llm: LLMBackend, max_tokens: int, show_reasoning: bool) -> None:
     # Truncate very large files — we only need enough context
     sample = code[:7000]
     if len(code) > 7000:
@@ -70,7 +70,7 @@ def analyse(code: str, filename: str, llm: LLMBackend) -> None:
     print(f"  Artefact: {filename}")
     print("═" * 48 + "\n")
 
-    gen = llm.chat(msgs, max_tokens=900, temperature=0.55, stream=True)
+    gen = llm.chat(msgs, max_tokens=max_tokens, temperature=0.55, stream=True, show_reasoning=show_reasoning)
     llm.stream_print(gen)
     print()
 
@@ -78,6 +78,8 @@ def analyse(code: str, filename: str, llm: LLMBackend) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description="Code Archaeologist — LLM-powered code analysis")
     p.add_argument("file", help="Source file to analyse, or '-' to read from stdin")
+    p.add_argument("--max-tokens", type=int, default=2048, metavar="N", help="Max tokens (default 2048)")
+    p.add_argument("--hide-reasoning", action="store_true", help="Hide chain-of-thought reasoning output")
     p.add_argument("--backend", choices=["openai", "llamacpp"], default=None)
     p.add_argument("--model", default=None)
     p.add_argument("--model-path", default=None)
@@ -104,7 +106,7 @@ def main() -> None:
     else:
         llm = default_backend()
 
-    analyse(code, filename, llm)
+    analyse(code, filename, llm, max_tokens=args.max_tokens, show_reasoning=not args.hide_reasoning)
 
 
 if __name__ == "__main__":
