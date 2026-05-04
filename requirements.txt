@@ -1,0 +1,7 @@
+# OpenAI-compatible backend (Ollama, llama.cpp server, LM Studio, real OpenAI)
+openai>=1.0.0
+
+# Direct llamacpp backend (loads a local .gguf file)
+# Install only if you want the llamacpp backend:
+#   pip install llama-cpp-python
+#   For GPU: CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python
