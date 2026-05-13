@@ -148,7 +148,7 @@ class LLMBackend:
 
     def complete(self, prompt: str, **kwargs) -> str | Generator[str, None, None]:
         """Single-turn completion shorthand."""
-        return self.chat([{"role": "user", "content": prompt}], **kwargs)
+        return self.chat(messages=[{"role": "user", "content": prompt}], **kwargs)
 
     # ------------------------------------------------------------------ #
     #  Tool-use loop                                                        #
@@ -292,12 +292,13 @@ class LLMBackend:
                 return json.loads(match.group(1))
             except json.JSONDecodeError:
                 pass
-        match = re.search(r"(\{[\s\S]+\}|\[[\s\S]+\])", text)
-        if match:
-            try:
-                return json.loads(match.group(1))
-            except json.JSONDecodeError:
-                pass
+        decoder = json.JSONDecoder()
+        for i, c in enumerate(text):
+            if c in "{[":
+                try:
+                    return decoder.raw_decode(text, i)[0]
+                except (json.JSONDecodeError, ValueError, IndexError):
+                    continue
         return None
 
 

@@ -90,8 +90,8 @@ def main() -> None:
         code = sys.stdin.read()
         filename = "<stdin>"
     else:
-        with open(args.file) as fh:
-            code = fh.read()
+        with open(args.file) as f:
+            code = f.read()
         filename = args.file
 
     if args.backend:
