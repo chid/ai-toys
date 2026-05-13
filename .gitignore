@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+pen_pal_journal.json
+pen_pal_journal.summary.txt
+*.bak.*
